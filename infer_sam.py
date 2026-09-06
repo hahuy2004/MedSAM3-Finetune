@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -336,11 +337,21 @@ class SAM3LoRAInference:
                 else:
                     masks_np = None
 
+                # Extract polygon contours for each detected object
+                polygons_per_object = []
+                if masks_np is not None:
+                    for i in range(len(masks_np)):
+                        polys = self._extract_polygons(masks_np[i])
+                        polygons_per_object.append(polys)
+                else:
+                    polygons_per_object = [[] for _ in range(num_keep)]
+
                 results[query_idx] = {
                     'prompt': prompt,
                     'boxes': boxes_xyxy.cpu().numpy(),
                     'scores': kept_scores.cpu().numpy(),
                     'masks': masks_np,
+                    'polygons': polygons_per_object,  # List[List[polygon]] per object
                     'num_detections': num_keep
                 }
                 print(f"   '{prompt}': {num_keep} detections after NMS (max score: {kept_scores.max().item():.3f})")
@@ -350,6 +361,7 @@ class SAM3LoRAInference:
                     'boxes': None,
                     'scores': None,
                     'masks': None,
+                    'polygons': [],
                     'num_detections': 0
                 }
                 print(f"   '{prompt}': 0 detections")
@@ -359,6 +371,43 @@ class SAM3LoRAInference:
 
         return results
 
+    def _extract_polygons(
+        self,
+        mask: "np.ndarray",
+        min_points: int = 3
+    ) -> List[List[List[int]]]:
+        """
+        Extract polygon contours from a binary mask.
+
+        Args:
+            mask: Boolean numpy array of shape [H, W].
+            min_points: Minimum number of points to keep a contour (default: 3).
+
+        Returns:
+            List of polygons, each polygon is a list of [x, y] integer points.
+            Example: [[[10, 20], [30, 40], [50, 60]], ...]
+        """
+        try:
+            import cv2
+            mask_uint8 = mask.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            polygons = []
+            for cnt in contours:
+                if len(cnt) >= min_points:
+                    poly = cnt.squeeze(axis=1).tolist()  # [[x, y], ...]
+                    polygons.append(poly)
+            return polygons
+        except ImportError:
+            # Fallback: extract all True pixel coordinates (no OpenCV)
+            ys, xs = np.where(mask)
+            if len(xs) == 0:
+                return []
+            # Return as a single "polygon" of all pixel coords (sparse format)
+            points = np.stack([xs, ys], axis=-1).tolist()
+            return [points]
+
     def visualize(
         self,
         results: dict,
@@ -366,7 +415,8 @@ class SAM3LoRAInference:
         show_boxes: bool = True,
         show_masks: bool = True,
         input_boxes: Optional[List[List[float]]] = None,
-        show_input_boxes: bool = False
+        show_input_boxes: bool = False,
+        show_polygons: bool = False
     ):
         """
         Visualize predictions on image.
@@ -378,6 +428,7 @@ class SAM3LoRAInference:
             show_masks: Whether to show segmentation masks
             input_boxes: Original bbox prompts [[x1, y1, x2, y2], ...] in pixel coords
             show_input_boxes: Whether to draw the input bbox prompts on the output image
+            show_polygons: Whether to draw polygon contour outlines and vertex dots
         """
         pil_image = results['_image']
 
@@ -481,6 +532,34 @@ class SAM3LoRAInference:
                         color='white'
                     )
 
+                # Draw polygon contours and vertex dots
+                if show_polygons and result.get('polygons') and i < len(result['polygons']):
+                    object_polygons = result['polygons'][i]  # List of contours for this object
+                    for poly in object_polygons:
+                        if len(poly) < 3:
+                            continue
+                        xy = np.array(poly, dtype=float)  # [[x, y], ...]
+                        # Draw filled polygon outline (closed, semi-transparent border)
+                        poly_patch = patches.Polygon(
+                            xy,
+                            closed=True,
+                            edgecolor=color,
+                            facecolor='none',
+                            linewidth=1.5,
+                            linestyle='-',
+                            alpha=0.9
+                        )
+                        ax.add_patch(poly_patch)
+                        # Draw vertex dots (every few points to avoid clutter)
+                        step = max(1, len(xy) // 40)  # at most ~40 dots per contour
+                        sampled = xy[::step]
+                        ax.scatter(
+                            sampled[:, 0], sampled[:, 1],
+                            s=6, c=color, marker='o',
+                            linewidths=0, alpha=0.85,
+                            zorder=5
+                        )
+
         ax.axis('off')
 
         # Add title with all prompts
@@ -578,6 +657,22 @@ def main():
         default=False,
         help="Draw the input bbox prompts (--box) on the output image as white dashed rectangles"
     )
+    parser.add_argument(
+        "--show-polygons",
+        action="store_true",
+        default=False,
+        help="Draw polygon contour outlines and vertex dots for each detected object on the output image"
+    )
+    parser.add_argument(
+        "--save-json",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Save detection results (bbox, score, polygon coords) to a JSON file. "
+            "Example: --save-json results/output.json"
+        )
+    )
 
     args = parser.parse_args()
 
@@ -600,8 +695,41 @@ def main():
         show_boxes=args.boundingbox,
         show_masks=not args.no_masks,
         input_boxes=args.boxes,
-        show_input_boxes=args.show_input_boxes
+        show_input_boxes=args.show_input_boxes,
+        show_polygons=args.show_polygons
     )
+
+    # Save JSON output if requested
+    if args.save_json:
+        json_data = {
+            "image": args.image,
+            "prompts": args.prompt,
+            "results": []
+        }
+        for idx in sorted([k for k in results.keys() if k != '_image']):
+            result = results[idx]
+            entry = {
+                "prompt": result['prompt'],
+                "num_detections": result['num_detections'],
+                "objects": []
+            }
+            if result['num_detections'] > 0 and result['boxes'] is not None:
+                for i in range(result['num_detections']):
+                    box = result['boxes'][i].tolist()
+                    score = float(result['scores'][i])
+                    polygons = result['polygons'][i] if result['polygons'] else []
+                    entry["objects"].append({
+                        "object_id": i,
+                        "score": round(score, 4),
+                        "bbox_xyxy": [round(v, 1) for v in box],
+                        "polygons": polygons  # List of contours, each [[x, y], ...]
+                    })
+            json_data["results"].append(entry)
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
+        with open(args.save_json, 'w') as f:
+            json.dump(json_data, f, indent=2)
+        print(f"\n💾 Saved JSON results to: {args.save_json}")
 
     # Print summary
     print("\n" + "="*60)
@@ -611,6 +739,9 @@ def main():
         print(f"   Prompt '{result['prompt']}': {result['num_detections']} detections")
         if result['num_detections'] > 0 and result['scores'] is not None:
             print(f"      Max confidence: {result['scores'].max():.3f}")
+        if result['num_detections'] > 0 and result.get('polygons'):
+            total_polys = sum(len(p) for p in result['polygons'])
+            print(f"      Polygon contours extracted: {total_polys}")
     print("="*60)
 
 
