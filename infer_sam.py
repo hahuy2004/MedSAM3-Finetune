@@ -364,7 +364,9 @@ class SAM3LoRAInference:
         results: dict,
         output_path: str,
         show_boxes: bool = True,
-        show_masks: bool = True
+        show_masks: bool = True,
+        input_boxes: Optional[List[List[float]]] = None,
+        show_input_boxes: bool = False
     ):
         """
         Visualize predictions on image.
@@ -372,8 +374,10 @@ class SAM3LoRAInference:
         Args:
             results: Results from predict()
             output_path: Where to save visualization
-            show_boxes: Whether to show bounding boxes
+            show_boxes: Whether to show prediction bounding boxes
             show_masks: Whether to show segmentation masks
+            input_boxes: Original bbox prompts [[x1, y1, x2, y2], ...] in pixel coords
+            show_input_boxes: Whether to draw the input bbox prompts on the output image
         """
         pil_image = results['_image']
 
@@ -385,6 +389,31 @@ class SAM3LoRAInference:
         colors = ['red', 'blue', 'green', 'yellow', 'cyan', 'magenta']
 
         total_detections = 0
+
+        # Draw input bbox prompts (white dashed) if requested
+        if show_input_boxes and input_boxes is not None and len(input_boxes) > 0:
+            img_w, img_h = pil_image.size
+            for b_idx, box in enumerate(input_boxes):
+                x1, y1, x2, y2 = box
+                x1 = max(0, min(img_w, x1))
+                y1 = max(0, min(img_h, y1))
+                x2 = max(0, min(img_w, x2))
+                y2 = max(0, min(img_h, y2))
+                rect = patches.Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=2,
+                    edgecolor='white',
+                    facecolor='none',
+                    linestyle='--'
+                )
+                ax.add_patch(rect)
+                ax.text(
+                    x1, y1 - 5,
+                    f"bbox prompt #{b_idx + 1}",
+                    bbox=dict(facecolor='black', alpha=0.5),
+                    fontsize=9,
+                    color='white'
+                )
 
         # Draw results for each prompt
         for idx in sorted([k for k in results.keys() if k != '_image']):
@@ -543,6 +572,13 @@ def main():
         )
     )
 
+    parser.add_argument(
+        "--show-input-boxes",
+        action="store_true",
+        default=False,
+        help="Draw the input bbox prompts (--box) on the output image as white dashed rectangles"
+    )
+
     args = parser.parse_args()
 
     # Initialize model
@@ -562,7 +598,9 @@ def main():
         results,
         args.output,
         show_boxes=args.boundingbox,
-        show_masks=not args.no_masks
+        show_masks=not args.no_masks,
+        input_boxes=args.boxes,
+        show_input_boxes=args.show_input_boxes
     )
 
     # Print summary
