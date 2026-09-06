@@ -160,13 +160,21 @@ class SAM3LoRAInference:
 
         print("✅ SAM3 + LoRA ready for inference!\n")
 
-    def create_datapoint(self, pil_image: PILImage.Image, text_prompts: List[str]) -> Datapoint:
+    def create_datapoint(
+        self,
+        pil_image: PILImage.Image,
+        text_prompts: List[str],
+        boxes: Optional[List[List[float]]] = None
+    ) -> Datapoint:
         """
-        Create a SAM3 datapoint from image and text prompts.
+        Create a SAM3 datapoint from image, text prompts, and optional bbox prompts.
 
         Args:
             pil_image: PIL Image
             text_prompts: List of text queries
+            boxes: Optional list of bounding boxes [[x1, y1, x2, y2], ...]
+                   in raw pixel coordinates (XYXY format, original image size).
+                   These are passed as visual/geometric prompts to the model.
 
         Returns:
             Datapoint with image and queries
@@ -180,12 +188,25 @@ class SAM3LoRAInference:
             size=[h, w]
         )
 
+        # Build bbox tensor if boxes are provided (shape: [N, 4], XYXY pixel coords)
+        if boxes is not None and len(boxes) > 0:
+            bbox_tensor = torch.as_tensor(boxes, dtype=torch.float32).view(-1, 4)
+            # Clamp to image bounds
+            bbox_tensor[:, 0::2].clamp_(min=0, max=w)
+            bbox_tensor[:, 1::2].clamp_(min=0, max=h)
+            bbox_label = torch.ones(len(bbox_tensor), dtype=torch.long)
+        else:
+            bbox_tensor = None
+            bbox_label = None
+
         # Create queries for each text prompt
         queries = []
         for idx, text_query in enumerate(text_prompts):
             query = FindQueryLoaded(
                 query_text=text_query,
                 image_id=0,
+                input_bbox=bbox_tensor,
+                input_bbox_label=bbox_label,
                 object_ids_output=[],
                 is_exhaustive=True,
                 query_processing_order=idx,
@@ -209,14 +230,17 @@ class SAM3LoRAInference:
     def predict(
         self,
         image_path: str,
-        text_prompts: List[str]
+        text_prompts: List[str],
+        boxes: Optional[List[List[float]]] = None
     ) -> dict:
         """
-        Run inference on an image with text prompts.
+        Run inference on an image with text prompts and optional bbox prompts.
 
         Args:
             image_path: Path to input image
-            text_prompts: List of text queries (e.g., ["crack", "defect"])
+            text_prompts: List of text queries (e.g., ["nucleus", "pronucleus"])
+            boxes: Optional list of example bounding boxes [[x1, y1, x2, y2], ...]
+                   in pixel coordinates (XYXY). Used as visual reference prompts.
 
         Returns:
             Dictionary mapping prompt index to predictions:
@@ -233,6 +257,8 @@ class SAM3LoRAInference:
         print(f"📷 Loaded image: {image_path}")
         print(f"   Size: {pil_image.size}")
         print(f"   Prompts: {text_prompts}")
+        if boxes is not None and len(boxes) > 0:
+            print(f"   Bbox prompts: {boxes}")
 
         print("\n🔮 Running inference...")
 
@@ -240,8 +266,8 @@ class SAM3LoRAInference:
 
         # Process each prompt separately (SAM3 expects one query per forward pass)
         for query_idx, prompt in enumerate(text_prompts):
-            # Create datapoint with single prompt
-            datapoint = self.create_datapoint(pil_image, [prompt])
+            # Create datapoint with single prompt (+ shared bbox prompts)
+            datapoint = self.create_datapoint(pil_image, [prompt], boxes=boxes)
 
             # Apply transforms
             datapoint = self.transform(datapoint)
@@ -502,6 +528,20 @@ def main():
         default=0.5,
         help="NMS IoU threshold (default: 0.5, lower = fewer overlapping boxes)"
     )
+    parser.add_argument(
+        "--box",
+        type=float,
+        nargs=4,
+        metavar=('X1', 'Y1', 'X2', 'Y2'),
+        action='append',
+        default=None,
+        dest='boxes',
+        help=(
+            "Example bounding box prompt in pixel coords (XYXY): --box x1 y1 x2 y2. "
+            "Can be repeated for multiple boxes, e.g.: --box 50 60 150 160 --box 200 220 320 350. "
+            "Boxes are shared across all --prompt values and guide the model geometrically."
+        )
+    )
 
     args = parser.parse_args()
 
@@ -515,7 +555,7 @@ def main():
     )
 
     # Run inference
-    results = inferencer.predict(args.image, args.prompt)
+    results = inferencer.predict(args.image, args.prompt, boxes=args.boxes)
 
     # Visualize
     inferencer.visualize(
