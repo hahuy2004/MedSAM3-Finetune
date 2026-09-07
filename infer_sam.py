@@ -232,7 +232,8 @@ class SAM3LoRAInference:
         self,
         image_path: str,
         text_prompts: List[str],
-        boxes: Optional[List[List[float]]] = None
+        boxes: Optional[List[List[float]]] = None,
+        max_points: Optional[int] = None
     ) -> dict:
         """
         Run inference on an image with text prompts and optional bbox prompts.
@@ -242,6 +243,8 @@ class SAM3LoRAInference:
             text_prompts: List of text queries (e.g., ["nucleus", "pronucleus"])
             boxes: Optional list of example bounding boxes [[x1, y1, x2, y2], ...]
                    in pixel coordinates (XYXY). Used as visual reference prompts.
+            max_points: Maximum number of polygon points per contour. None = no limit.
+                        Uses Douglas-Peucker simplification then downsampling.
 
         Returns:
             Dictionary mapping prompt index to predictions:
@@ -341,7 +344,7 @@ class SAM3LoRAInference:
                 polygons_per_object = []
                 if masks_np is not None:
                     for i in range(len(masks_np)):
-                        polys = self._extract_polygons(masks_np[i])
+                        polys = self._extract_polygons(masks_np[i], max_points=max_points)
                         polygons_per_object.append(polys)
                 else:
                     polygons_per_object = [[] for _ in range(num_keep)]
@@ -374,7 +377,8 @@ class SAM3LoRAInference:
     def _extract_polygons(
         self,
         mask: "np.ndarray",
-        min_points: int = 3
+        min_points: int = 3,
+        max_points: Optional[int] = None
     ) -> List[List[List[int]]]:
         """
         Extract polygon contours from a binary mask.
@@ -382,6 +386,9 @@ class SAM3LoRAInference:
         Args:
             mask: Boolean numpy array of shape [H, W].
             min_points: Minimum number of points to keep a contour (default: 3).
+            max_points: Maximum number of points per contour. If set, first
+                        simplifies with Douglas-Peucker (cv2.approxPolyDP) then
+                        hard-caps with uniform downsampling. None = no limit.
 
         Returns:
             List of polygons, each polygon is a list of [x, y] integer points.
@@ -395,8 +402,18 @@ class SAM3LoRAInference:
             )
             polygons = []
             for cnt in contours:
-                if len(cnt) >= min_points:
-                    poly = cnt.squeeze(axis=1).tolist()  # [[x, y], ...]
+                if len(cnt) < min_points:
+                    continue
+                # Step 1: Simplify with Douglas-Peucker if max_points is set
+                if max_points is not None and len(cnt) > max_points:
+                    epsilon = 0.005 * cv2.arcLength(cnt, True)
+                    cnt = cv2.approxPolyDP(cnt, epsilon, True)
+                # Step 2: Hard-cap with uniform downsampling as safety net
+                if max_points is not None and len(cnt) > max_points:
+                    step = max(1, len(cnt) // max_points)
+                    cnt = cnt[::step]
+                poly = cnt.squeeze(axis=1).tolist()  # [[x, y], ...]
+                if len(poly) >= min_points:
                     polygons.append(poly)
             return polygons
         except ImportError:
@@ -404,8 +421,11 @@ class SAM3LoRAInference:
             ys, xs = np.where(mask)
             if len(xs) == 0:
                 return []
-            # Return as a single "polygon" of all pixel coords (sparse format)
             points = np.stack([xs, ys], axis=-1).tolist()
+            # Hard-cap with uniform downsampling if needed
+            if max_points is not None and len(points) > max_points:
+                step = max(1, len(points) // max_points)
+                points = points[::step]
             return [points]
 
     def visualize(
@@ -664,6 +684,17 @@ def main():
         help="Draw polygon contour outlines and vertex dots for each detected object on the output image"
     )
     parser.add_argument(
+        "--max-points",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum number of polygon points per contour. "
+            "Uses Douglas-Peucker simplification first, then uniform downsampling as a cap. "
+            "Example: --max-points 50. Default: no limit."
+        )
+    )
+    parser.add_argument(
         "--save-json",
         type=str,
         default=None,
@@ -686,7 +717,11 @@ def main():
     )
 
     # Run inference
-    results = inferencer.predict(args.image, args.prompt, boxes=args.boxes)
+    results = inferencer.predict(
+        args.image, args.prompt,
+        boxes=args.boxes,
+        max_points=args.max_points
+    )
 
     # Visualize
     inferencer.visualize(
