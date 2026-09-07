@@ -409,39 +409,55 @@ class SAM3LoRAInference:
         try:
             import cv2
             mask_uint8 = mask.astype(np.uint8) * 255
-            # For 'uniform': start with CHAIN_APPROX_NONE (all border pixels)
-            # so linspace can sample evenly. For 'approx': CHAIN_APPROX_SIMPLE
-            # (removes collinear points) is a good pre-reduction before DP.
-            approx_method = (
-                cv2.CHAIN_APPROX_NONE
-                if (max_points is not None and polygon_method == "uniform")
-                else cv2.CHAIN_APPROX_SIMPLE
-            )
+
+            # Choose contour extraction method:
+            # - 'approx': uses CHAIN_APPROX_NONE (all border pixels) so DP has
+            #   the full set to work with.
+            # - 'uniform' + max_points: uses CHAIN_APPROX_NONE for even linspace.
+            # - default (no reduction needed): CHAIN_APPROX_SIMPLE is faster.
+            if polygon_method == "approx" or (polygon_method == "uniform" and max_points is not None):
+                find_method = cv2.CHAIN_APPROX_NONE
+            else:
+                find_method = cv2.CHAIN_APPROX_SIMPLE
+
             contours, _ = cv2.findContours(
-                mask_uint8, cv2.RETR_EXTERNAL, approx_method
+                mask_uint8, cv2.RETR_EXTERNAL, find_method
             )
             polygons = []
             for cnt in contours:
                 if len(cnt) < min_points:
                     continue
-                if max_points is not None and len(cnt) > max_points:
-                    if polygon_method == "approx":
-                        # Douglas-Peucker: preserves shape-critical corners.
-                        # Iteratively tighten epsilon until we fit within max_points.
-                        epsilon = 0.001 * cv2.arcLength(cnt, True)
-                        approx = cv2.approxPolyDP(cnt, epsilon, True)
-                        # If still too many points, increase epsilon gradually
-                        while len(approx) > max_points and epsilon < cv2.arcLength(cnt, True):
+
+                if polygon_method == "approx":
+                    # --- Douglas-Peucker ---
+                    # Always runs regardless of max_points. Removes redundant
+                    # collinear/near-collinear points while preserving corners.
+                    # Default epsilon = 0.5% of perimeter (good general smoothing).
+                    perimeter = cv2.arcLength(cnt, True)
+                    epsilon = 0.005 * perimeter
+                    cnt = cv2.approxPolyDP(cnt, epsilon, True)
+
+                    # If max_points is also provided, further cap the result:
+                    if max_points is not None and len(cnt) > max_points:
+                        # Tighten epsilon iteratively until within budget.
+                        while len(cnt) > max_points and epsilon < perimeter:
                             epsilon *= 1.5
-                            approx = cv2.approxPolyDP(cnt, epsilon, True)
-                        cnt = approx
-                    else:  # 'uniform' (default)
-                        # Uniform downsampling: guarantees exactly max_points,
-                        # evenly distributed around the full contour.
-                        indices = np.round(
-                            np.linspace(0, len(cnt) - 1, max_points)
-                        ).astype(int)
-                        cnt = cnt[indices]
+                            cnt = cv2.approxPolyDP(
+                                cv2.approxPolyDP(cnt, 0, True),  # re-expand shape
+                                epsilon, True
+                            )
+
+                elif polygon_method == "uniform" and max_points is not None:
+                    # --- Uniform downsampling ---
+                    # Only activates when max_points is explicitly given.
+                    # Guarantees exactly max_points, evenly distributed around contour.
+                    indices = np.round(
+                        np.linspace(0, len(cnt) - 1, max_points)
+                    ).astype(int)
+                    cnt = cnt[indices]
+
+                # else: default — keep all points from CHAIN_APPROX_SIMPLE as-is.
+
                 poly = cnt.squeeze(axis=1).tolist()  # [[x, y], ...]
                 if len(poly) >= min_points:
                     polygons.append(poly)
