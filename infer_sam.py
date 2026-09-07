@@ -233,7 +233,8 @@ class SAM3LoRAInference:
         image_path: str,
         text_prompts: List[str],
         boxes: Optional[List[List[float]]] = None,
-        max_points: Optional[int] = None
+        max_points: Optional[int] = None,
+        polygon_method: str = "uniform"
     ) -> dict:
         """
         Run inference on an image with text prompts and optional bbox prompts.
@@ -344,7 +345,11 @@ class SAM3LoRAInference:
                 polygons_per_object = []
                 if masks_np is not None:
                     for i in range(len(masks_np)):
-                        polys = self._extract_polygons(masks_np[i], max_points=max_points)
+                        polys = self._extract_polygons(
+                            masks_np[i],
+                            max_points=max_points,
+                            polygon_method=polygon_method
+                        )
                         polygons_per_object.append(polys)
                 else:
                     polygons_per_object = [[] for _ in range(num_keep)]
@@ -378,7 +383,8 @@ class SAM3LoRAInference:
         self,
         mask: "np.ndarray",
         min_points: int = 3,
-        max_points: Optional[int] = None
+        max_points: Optional[int] = None,
+        polygon_method: str = "uniform"
     ) -> List[List[List[int]]]:
         """
         Extract polygon contours from a binary mask.
@@ -386,9 +392,15 @@ class SAM3LoRAInference:
         Args:
             mask: Boolean numpy array of shape [H, W].
             min_points: Minimum number of points to keep a contour (default: 3).
-            max_points: Maximum number of points per contour. If set, first
-                        simplifies with Douglas-Peucker (cv2.approxPolyDP) then
-                        hard-caps with uniform downsampling. None = no limit.
+            max_points: Maximum number of points per contour. None = no limit.
+            polygon_method: How to reduce points when max_points is set:
+                - 'uniform': Uniform downsampling via np.linspace. Guarantees
+                             exactly max_points output, evenly spaced around
+                             the contour. Predictable but may skip sharp corners.
+                - 'approx':  Douglas-Peucker shape simplification
+                             (cv2.approxPolyDP). Keeps visually important corners
+                             and removes redundant collinear points. Result may
+                             be fewer than max_points but better shape fidelity.
 
         Returns:
             List of polygons, each polygon is a list of [x, y] integer points.
@@ -397,21 +409,39 @@ class SAM3LoRAInference:
         try:
             import cv2
             mask_uint8 = mask.astype(np.uint8) * 255
+            # For 'uniform': start with CHAIN_APPROX_NONE (all border pixels)
+            # so linspace can sample evenly. For 'approx': CHAIN_APPROX_SIMPLE
+            # (removes collinear points) is a good pre-reduction before DP.
+            approx_method = (
+                cv2.CHAIN_APPROX_NONE
+                if (max_points is not None and polygon_method == "uniform")
+                else cv2.CHAIN_APPROX_SIMPLE
+            )
             contours, _ = cv2.findContours(
-                mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                mask_uint8, cv2.RETR_EXTERNAL, approx_method
             )
             polygons = []
             for cnt in contours:
                 if len(cnt) < min_points:
                     continue
-                # Step 1: Simplify with Douglas-Peucker if max_points is set
                 if max_points is not None and len(cnt) > max_points:
-                    epsilon = 0.005 * cv2.arcLength(cnt, True)
-                    cnt = cv2.approxPolyDP(cnt, epsilon, True)
-                # Step 2: Hard-cap with uniform downsampling as safety net
-                if max_points is not None and len(cnt) > max_points:
-                    step = max(1, len(cnt) // max_points)
-                    cnt = cnt[::step]
+                    if polygon_method == "approx":
+                        # Douglas-Peucker: preserves shape-critical corners.
+                        # Iteratively tighten epsilon until we fit within max_points.
+                        epsilon = 0.001 * cv2.arcLength(cnt, True)
+                        approx = cv2.approxPolyDP(cnt, epsilon, True)
+                        # If still too many points, increase epsilon gradually
+                        while len(approx) > max_points and epsilon < cv2.arcLength(cnt, True):
+                            epsilon *= 1.5
+                            approx = cv2.approxPolyDP(cnt, epsilon, True)
+                        cnt = approx
+                    else:  # 'uniform' (default)
+                        # Uniform downsampling: guarantees exactly max_points,
+                        # evenly distributed around the full contour.
+                        indices = np.round(
+                            np.linspace(0, len(cnt) - 1, max_points)
+                        ).astype(int)
+                        cnt = cnt[indices]
                 poly = cnt.squeeze(axis=1).tolist()  # [[x, y], ...]
                 if len(poly) >= min_points:
                     polygons.append(poly)
@@ -690,8 +720,18 @@ def main():
         metavar="N",
         help=(
             "Maximum number of polygon points per contour. "
-            "Uses Douglas-Peucker simplification first, then uniform downsampling as a cap. "
-            "Example: --max-points 50. Default: no limit."
+            "Example: --max-points 100. Default: no limit."
+        )
+    )
+    parser.add_argument(
+        "--polygon-method",
+        type=str,
+        default="uniform",
+        choices=["uniform", "approx"],
+        help=(
+            "Method to reduce polygon points when --max-points is set. "
+            "'uniform': Uniform downsampling — guarantees exactly max_points, evenly spaced (default). "
+            "'approx': Douglas-Peucker — preserves shape-critical corners, result may be fewer than max_points."
         )
     )
     parser.add_argument(
@@ -720,7 +760,8 @@ def main():
     results = inferencer.predict(
         args.image, args.prompt,
         boxes=args.boxes,
-        max_points=args.max_points
+        max_points=args.max_points,
+        polygon_method=args.polygon_method
     )
 
     # Visualize
